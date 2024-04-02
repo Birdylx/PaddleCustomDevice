@@ -17,6 +17,12 @@
 
 namespace custom_kernel {
 
+template <typename T, typename Context>
+void TransposeKernel(const Context& dev_ctx,
+                     const phi::DenseTensor& x,
+                     const std::vector<int>& axis,
+                     phi::DenseTensor* out);
+
 template <typename T = int>
 inline void UpdatePadding(std::vector<T>* paddings,
                           const bool global_pooling,
@@ -70,18 +76,18 @@ inline void UpdatePadding(std::vector<T>* paddings,
 
 template <typename T, typename Context>
 void AclopPool2dKernel(const Context& dev_ctx,
-                  const phi::DenseTensor& in_x,
-                  const phi::IntArray& kernel_size,
-                  const std::vector<int>& strides_t,
-                  const std::vector<int>& paddings_t,
-                  bool ceil_mode,
-                  bool exclusive,
-                  const std::string& data_format,
-                  const std::string& pooling_type,
-                  bool global_pooling,
-                  bool adaptive,
-                  const std::string& padding_algorithm,
-                  phi::DenseTensor* out) {
+                       const phi::DenseTensor& in_x,
+                       const phi::IntArray& kernel_size,
+                       const std::vector<int>& strides_t,
+                       const std::vector<int>& paddings_t,
+                       bool ceil_mode,
+                       bool exclusive,
+                       const std::string& data_format,
+                       const std::string& pooling_type,
+                       bool global_pooling,
+                       bool adaptive,
+                       const std::string& padding_algorithm,
+                       phi::DenseTensor* out) {
   dev_ctx.template Alloc<T>(out);
 
   std::vector<int> ksize(kernel_size.GetData().begin(),
@@ -374,7 +380,7 @@ void Pool2dKernel(const Context& dev_ctx,
                                    "max(strides[0], strides[1]) is %d.",
                                    64,
                                    std::max(strides[0], strides[1])));
-  
+
   // pool2d only support NCHW
   phi::DenseTensor transformed_input, transformed_output;
   if (channel_last) {
@@ -390,40 +396,38 @@ void Pool2dKernel(const Context& dev_ctx,
                     {in_x_tensor},
                     {transformed_input},
                     {{"src_format", std::string("NHWC")},
-                      {"dst_format", std::string("NCHW")}});
+                     {"dst_format", std::string("NCHW")}});
     trans_runner.Run(dev_ctx.stream());
   } else {
     transformed_input = in_x_tensor;
     transformed_output = out_tensor;
   }
-  
+
   if (adaptive) {
     std::string pooling_mode = "AdaptiveAvgPool2d";
     if (pooling_type == "max") {
       pooling_mode = "AdaptiveMaxPool2d";
     }
 
-    // -------------------------------- aclnn -----------------------------
-    auto out_shape = phi::vectorize<int>(out_data_dims);
+    phi::IntArray out_shape = {out_data_dims[0], out_data_dims[1]};
     if (pooling_mode == "AdaptiveAvgPool2d") {
-      std::cout << "--------adaptive avgpool---------" << std::endl;
-      EXEC_NPU_CMD(aclnnAdaptiveAvgPool2d, dev_ctx, transformed_input, out_shape, transformed_output);
+      EXEC_NPU_CMD(aclnnAdaptiveAvgPool2d,
+                   dev_ctx,
+                   transformed_input,
+                   out_shape,
+                   transformed_output);
     } else if (pooling_mode == "AdaptiveMaxPool2d") {
-      std::cout << "--------adaptive maxpool---------" << std::endl;
       phi::DenseTensor indices;
       phi::DenseTensorMeta indices_meta = {phi::DataType::INT64, out_data_dims};
       indices.set_meta(indices_meta);
       dev_ctx.template Alloc<int64_t>(&indices);
-      EXEC_NPU_CMD(aclnnAdaptiveMaxPool2d, dev_ctx, transformed_input, out_shape, transformed_output, indices);
+      EXEC_NPU_CMD(aclnnAdaptiveMaxPool2d,
+                   dev_ctx,
+                   transformed_input,
+                   out_shape,
+                   transformed_output,
+                   indices);
     }
-
-    // -------------------------------- aclop -----------------------------
-    // const auto& runner =
-    //     NpuOpRunner(pooling_mode,
-    //                 {transformed_input},
-    //                 {transformed_output},
-    //                 {{"output_size", phi::vectorize<int>(out_data_dims)}});
-    // runner.Run(dev_ctx.stream());
   } else {
     std::string pooling_mode = "AvgPoolV2";
     if (pooling_type == "max") {
@@ -435,52 +439,53 @@ void Pool2dKernel(const Context& dev_ctx,
       pooling_mode = "MaxPoolV3";
     }
 
-    // -------------------------------- aclnn -----------------------------
-    std::vector<int> ksize_vec_new = {ksize_vec[2], ksize_vec[3]};
-    std::vector<int> strides_vec_new = {strides_vec[2], strides_vec[3]};
-    std::vector<int> paddings_vec_new = {paddings[2], paddings[3]};
+    phi::IntArray ksize_vec_new = {ksize[0], ksize[1]};
+    phi::IntArray strides_vec_new = {strides[0], strides[1]};
+    phi::IntArray paddings_vec_new = {
+        paddings[1],
+        paddings[3]};  // only support sync padding, {top, bottom, left, right};
     if (pooling_mode == "AvgPoolV2") {
-      std::cout << "---------avgpool---------" << std::endl;
       bool count_include_pad = !exclusive;
       uint64_t s_divisor_override = 0;
       uint8_t cube_math_type = 0;
-      EXEC_NPU_CMD(aclnnAvgPool2d, dev_ctx, in_x_tensor, ksize_vec_new, strides_vec_new, paddings_vec_new, ceil_mode, count_include_pad, s_divisor_override,
-                 cube_math_type, out_tensor);
+      EXEC_NPU_CMD(aclnnAvgPool2d,
+                   dev_ctx,
+                   transformed_input,
+                   ksize_vec_new,
+                   strides_vec_new,
+                   paddings_vec_new,
+                   ceil_mode,
+                   count_include_pad,
+                   s_divisor_override,
+                   cube_math_type,
+                   transformed_output);
     } else if (pooling_mode == "MaxPoolV3") {
-      std::cout << "---------maxpool---------" << std::endl;
-      std::vector<int> dilation_vec = {1, 1}; // paddle do not have dialtion parameter in MaxPool2D
+      phi::IntArray dilation_vec = {
+          1, 1};  // paddle do not have dialtion parameter in MaxPool2D
       phi::DenseTensor indices;
       phi::DenseTensorMeta indices_meta = {phi::DataType::INT8, {}};
       indices.set_meta(indices_meta);
       dev_ctx.template Alloc<int8_t>(&indices);
-      EXEC_NPU_CMD(aclnnMaxPool2dWithMask, dev_ctx, in_x_tensor, ksize_vec_new, strides_vec_new, paddings_vec_new, dilation_vec, ceil_mode,
-                  out_tensor, indices);
-    // }
-
-    // -------------------------------- aclop -----------------------------
-    // const auto& runner =
-    //   NpuOpRunner(pooling_mode,
-    //               {in_x_tensor},
-    //               {out_tensor},
-    //               {{"ksize", ksize_vec},
-    //                {"strides", strides_vec},
-    //                {"padding_mode", std::string("CALCULATED")},
-    //                {"pads", paddings},
-    //                {"data_format", data_format},
-    //                {"global_pooling", global_pooling},
-    //                {"ceil_mode", ceil_mode},
-    //                {"exclusive", exclusive}});
-    // runner.Run(dev_ctx.stream());
+      EXEC_NPU_CMD(aclnnMaxPool2dWithMask,
+                   dev_ctx,
+                   transformed_input,
+                   ksize_vec_new,
+                   strides_vec_new,
+                   paddings_vec_new,
+                   dilation_vec,
+                   ceil_mode,
+                   transformed_output,
+                   indices);
+    }
   }
-
   // pool2d only support NCHW
-  if (pooling_type == "avg" && channel_last) {
+  if (channel_last) {
     const auto& trans_runner =
         NpuOpRunner("TransData",
                     {transformed_output},
                     {out_tensor},
                     {{"src_format", std::string("NCHW")},
-                      {"dst_format", std::string("NHWC")}});
+                     {"dst_format", std::string("NHWC")}});
     trans_runner.Run(dev_ctx.stream());
   }
 }
