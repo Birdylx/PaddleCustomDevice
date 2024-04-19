@@ -17,6 +17,12 @@
 
 namespace custom_kernel {
 
+template <typename T, typename Context>
+void CastKernel(const Context& dev_ctx,
+                const phi::DenseTensor& x,
+                phi::DataType dtype,
+                phi::DenseTensor* out);
+
 using Tensor = phi::DenseTensor;
 
 template <typename Context>
@@ -60,13 +66,13 @@ static void CumsumImp(const Tensor& input,
 }
 
 template <typename T, typename Context>
-void CumsumKernel(const Context& dev_ctx,
-                  const phi::DenseTensor& x,
-                  const phi::Scalar& axis_scalar,
-                  bool flatten,
-                  bool exclusive,
-                  bool reverse,
-                  phi::DenseTensor* out) {
+void AclopCumsumKernel(const Context& dev_ctx,
+                       const phi::DenseTensor& x,
+                       const phi::Scalar& axis_scalar,
+                       bool flatten,
+                       bool exclusive,
+                       bool reverse,
+                       phi::DenseTensor* out) {
   dev_ctx.template Alloc<T>(out);
 
   auto axis = axis_scalar.to<int>();
@@ -89,6 +95,39 @@ void CumsumKernel(const Context& dev_ctx,
     CumsumImp<Context>(new_x, out, attr_input, dev_ctx);
   } else {
     CumsumImp<Context>(x, out, attr_input, dev_ctx);
+  }
+}
+
+template <typename T, typename Context>
+void CumsumKernel(const Context& dev_ctx,
+                  const phi::DenseTensor& x,
+                  const phi::Scalar& axis_scalar,
+                  bool flatten,
+                  bool exclusive,
+                  bool reverse,
+                  phi::DenseTensor* out) {
+  DO_COMPATIBILITY(
+      aclnnCumsumV2,
+      (custom_kernel::AclopCumsumKernel<T, Context>(
+          dev_ctx, x, axis_scalar, flatten, exclusive, reverse, out)));
+  dev_ctx.template Alloc<T>(out);
+  auto axis = axis_scalar.to<int64_t>();
+
+  if (flatten) {
+    PADDLE_ENFORCE_EQ(
+        axis,
+        -1,
+        phi::errors::InvalidArgument(
+            "when flatten is true, attr axis must be default %d, but got %d",
+            -1,
+            axis));
+
+    Tensor new_x(x);
+    new_x.Resize(phi::make_ddim({x.numel()}));
+
+    EXEC_NPU_CMD(aclnnCumsumV2, dev_ctx, new_x, axis, exclusive, reverse, *out);
+  } else {
+    EXEC_NPU_CMD(aclnnCumsumV2, dev_ctx, x, axis, exclusive, reverse, *out);
   }
 }
 

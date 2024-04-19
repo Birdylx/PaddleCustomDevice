@@ -46,6 +46,7 @@ FLAGS_DEFINE_bool(
     npu_storage_format,
     false,
     "Enable NPU Storage Format for Ascend910 performance improvement.");
+FLAGS_DEFINE_bool(npu_jit_compile, true, "enable npu jit compile");
 
 NpuOpRunner::NpuOpRunner() {}
 
@@ -328,11 +329,31 @@ std::vector<aclDataBuffer *> &NpuOpRunner::GetOutputBuffers() {
   return output_buffers_;
 }
 
+const std::unordered_map<phi::DataType, size_t> dataTypeToByteSize = {
+    {phi::DataType::FLOAT32, sizeof(float)},
+    {phi::DataType::FLOAT16,
+     sizeof(uint16_t)},  // 通常用 uint16_t 来表示 float16
+    {phi::DataType::INT64, sizeof(int64_t)},
+    {phi::DataType::INT32, sizeof(int32_t)},
+    {phi::DataType::INT8, sizeof(int8_t)},
+    {phi::DataType::UINT8, sizeof(uint8_t)},
+    {phi::DataType::BOOL, sizeof(bool)}};
+
 aclTensorDesc *NpuOpRunner::CreateTensorDesc(phi::DenseTensor tensor,
                                              aclMemType mem_type) {
   auto data_type = ConvertToNpuDtype(tensor.dtype());
   auto origin_format = ConvertToNpuFormat(tensor.layout());
   auto origin_dims = phi::vectorize(tensor.dims());
+
+  if (!tensor.meta().is_contiguous()) {
+    auto it = dataTypeToByteSize.find(tensor.dtype());
+    if (it != dataTypeToByteSize.end()) {
+      size_t byteSize = it->second;
+      origin_dims = phi::vectorize({
+          tensor.capacity() / byteSize,
+      });
+    }
+  }
 
   auto origin_size = origin_dims.size();
   bool is_scalar = tensor.dims().size() == 0;
@@ -587,8 +608,6 @@ bool NpuOpRunner::GetFloatStatus(aclrtStream stream) {
 }
 
 void NpuOpRunner::Run(aclrtStream stream, bool sync) const {
-  static bool isAclEnableJit = false;
-
   PADDLE_ENFORCE_NOT_NULL(
       stream,
       phi::errors::External("Stream should not be null, please check."));
@@ -597,10 +616,16 @@ void NpuOpRunner::Run(aclrtStream stream, bool sync) const {
           << GetOpDescString(input_descs_, "Input")
           << GetOpDescString(output_descs_, "Output");
 
-  if (!isAclEnableJit) {
-    aclSetCompileopt(ACL_OP_JIT_COMPILE, "enable");
-    isAclEnableJit = true;
-  }
+  static std::once_flag jit_compile_flag;
+  std::call_once(jit_compile_flag, [&]() {
+    if (FLAGS_npu_jit_compile) {
+      aclSetCompileopt(ACL_OP_JIT_COMPILE, "enable");
+    } else {
+      aclSetCompileopt(ACL_OP_JIT_COMPILE, "disable");
+    }
+  });
+  SetDeterministic();
+
   aclError ret;
   // Ensure that the Gil has been released before running
   // aclopCompileAndExecute.
