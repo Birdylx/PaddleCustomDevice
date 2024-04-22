@@ -16,7 +16,18 @@
 #include "kernels/funcs/npu_op_runner.h"
 #include "paddle/phi/core/distributed/comm_context_manager.h"
 #include "paddle/phi/core/distributed/xccl_comm_context.h"
-#include "phi/core/distributed/utils.h"
+
+#include "paddle/phi/kernels/funcs/tensor_formatter.h"
+
+void print_tensor(const phi::DenseTensor& tensor, std::string name) {
+  std::cout << "========== " << name << " ==========" << std::endl;
+  std::cout << "shape: ";
+  for (int i = 0; i < tensor.dims().size(); ++i) {
+    std::cout <<  tensor.dims()[i] << ", ";
+  }
+  std::cout << std::endl;
+  std::cout << "dtype: " << tensor.dtype() << std::endl;
+}
 
 inline void ExtractNCWHD(const phi::DDim& dims,
                          const phi::DataLayout& data_layout,
@@ -44,7 +55,29 @@ inline void ExtractNCWHD(const phi::DDim& dims,
   }
 }
 
+int64_t GetGlobalWorldSize() {
+  const char* world_size = std::getenv("PADDLE_TRAINERS_NUM");
+  if (world_size == nullptr) {
+    return 1;
+  }
+  return std::atoi(world_size);
+}
+
 namespace custom_kernel {
+
+template <typename T, typename Context>
+void CastKernel(const Context& dev_ctx,
+                const phi::DenseTensor& x,
+                phi::DataType dtype,
+                phi::DenseTensor* out);
+
+template <typename T, typename Context>
+void SumKernel(const Context& dev_ctx,
+               const phi::DenseTensor& x,
+               const phi::IntArray& axes,
+               phi::DataType out_dtype,
+               bool keep_dim,
+               phi::DenseTensor* out);
 
 template <typename T, typename Context>
 void ConcatKernel(const Context& dev_ctx,
@@ -53,7 +86,6 @@ void ConcatKernel(const Context& dev_ctx,
                   phi::DenseTensor* out);
 
 template <typename T, typename Context>
-<<<<<<< HEAD
 void StackKernel(const Context& dev_ctx,
                  const std::vector<const phi::DenseTensor*>& x,
                  int axis,
@@ -112,15 +144,9 @@ void BatchNormKernel(const Context& dev_ctx,
                      phi::DenseTensor* saved_variance,
                      phi::DenseTensor* reserve_space);
 
-template <typename Context>
-void custom_all_gather(const Context& dev_ctx,
-                       phi::DenseTensor* out_tensor,
-                       const phi::DenseTensor& in_tensor,
-                       bool sync_op) {
+void custom_all_gather(phi::DenseTensor* out_tensor,
+                       const phi::DenseTensor& in_tensor) {
   int global_gid = 0;
-  int offset = 0;
-  int numel = -1;
-  bool use_calc_stream = false;
 
   // get comm_context
   const auto& comm_context_manager =
@@ -128,20 +154,8 @@ void custom_all_gather(const Context& dev_ctx,
   auto comm_context = static_cast<phi::distributed::XCCLCommContext*>(
       comm_context_manager.Get(std::to_string(global_gid)));
 
-  auto tensor_tmp =
-      paddle::experimental::CheckAndTrans2NewContiguousTensor(in_tensor);
-  // numel > 0 indicates the tensor need to be sliced
-  const phi::DenseTensor& in_tensor_maybe_partial =
-      numel > 0 ? GetPartialTensor(tensor_tmp, offset, numel) : tensor_tmp;
-  auto task = RunFnInXCCLEnv(
-      [&](const phi::stream::Stream& stream) {
-        comm_context->AllGather(out_tensor, in_tensor_maybe_partial, stream);
-      },
-      in_tensor_maybe_partial,
-      CommType::ALLGATHER,
-      sync_op,
-      use_calc_stream);
-  task->UpdateWaitChain(*dev_ctx);
+  auto& xccl_stream = *comm_context->GetStream().get();
+  comm_context->AllGather(out_tensor, in_tensor, xccl_stream);
 }
 
 template <typename T, typename Context>
@@ -163,7 +177,7 @@ void SyncBatchNormKernel(const Context& dev_ctx,
                          phi::DenseTensor* saved_mean,
                          phi::DenseTensor* saved_variance,
                          phi::DenseTensor* reserve_space) {
-  const DataLayout layout = StringToDataLayout(data_layout_str);
+  const phi::DataLayout layout = StringToDataLayout(data_layout_str);
   PADDLE_ENFORCE_EQ(use_global_stats,
                     false,
                     phi::errors::InvalidArgument(
@@ -179,6 +193,7 @@ void SyncBatchNormKernel(const Context& dev_ctx,
                     5,
                     phi::errors::InvalidArgument(
                         "The Input dim size should be less than 6."));
+  const bool channel_last = data_layout_str == "NHWC" && x_dims.size() > 2;
   int N, C, H, W, D;
   ExtractNCWHD(x_dims, layout, &N, &C, &H, &W, &D);
 
@@ -205,9 +220,9 @@ void SyncBatchNormKernel(const Context& dev_ctx,
     // ===================================================
     // step 1: calculate sum/square_sum of current input.
     // ===================================================
-    phi::DenseTensor x_tensor(x)
-        // transform 3d tensor to 4d tensor to satisfy the format
-        if (x.dims().size() == 3) {
+    phi::DenseTensor x_tensor(x);
+    // transform 3d tensor to 4d tensor to satisfy the format
+    if (x.dims().size() == 3) {
       auto x_shape_vec = phi::vectorize(x.dims());
       if (channel_last) {
         x_shape_vec.insert(x_shape_vec.begin() + 2, 1);  // expand NLC -> NL1C
@@ -250,87 +265,123 @@ void SyncBatchNormKernel(const Context& dev_ctx,
         .AddInput(x_tensor)
         .AddOutput(sum)
         .AddOutput(square_sum)
-        .AddAttrs({{"epsilon", epsilon}})
         .Run(stream);
 
     // ======================================================
     // step 2: gather sum_all/square_sum_all of global input
     // ======================================================
+    paddle::funcs::TensorFormatter formatter;
     phi::DenseTensorMeta count_meta = {phi::DataType::FLOAT32, {1}};
     phi::DenseTensor count;
     count.set_meta(count_meta);
-    dev_ctx.template Alloc<float>(count);
+    dev_ctx.template Alloc<float>(&count);
     FillNpuTensorWithConstant<float>(
         &count, dev_ctx, static_cast<float>(N * H * W * D));
 
     // C, C, 1 -> (2C + 1)
+    int world_size = GetGlobalWorldSize();
     phi::DenseTensor combined;
+    combined.Resize({2 * C + 1});
     custom_kernel::ConcatKernel<float, Context>(
-        dev_ctx, {&sum, &square_sum, &count}, 0, &combined);
-    // world_size * (2C + 1)
-    std::vector<phi::DenseTensor> combined_list(
-        world_size, phi::EmptyLike<float, Context>(dev_ctx, combined));
-    std::vector<phi::DenseTensor*> combined_list_ptr;
-    for (int i = 0; i < combined_list.size(); ++i) {
-      combined_list_ptr.push_back(&combined_list[i]);
-    }
+        dev_ctx, {&sum, &square_sum, &count}, 0, &combined);    
 
+    phi::DenseTensorMeta stack_meta = {phi::DataType::FLOAT32, {world_size, 2 * C + 1}};
     phi::DenseTensor stacked_combined;
-    custom_kernel::StackKernel<float, Context>(
-        dev_ctx, combined_list_ptr, 0, &stacked_combined);
-    custom_kernel::custom_all_gather<Context>(
-        dev_ctx, &stacked_combined, combined);
-    std::vector<phi::DenseTensor*> split_stacked_combined(3);
-    phi::IntArray num_secs = {world_size * C, world_size * C, world_size * 1};
+    stacked_combined.set_meta(stack_meta);
+    dev_ctx.template Alloc<float>(&stacked_combined);
+    
+    dev_ctx.Wait();
+    formatter.Print(combined);
+    custom_kernel::custom_all_gather(&stacked_combined, combined);
+    dev_ctx.Wait();
+    formatter.Print(stacked_combined);
+
+    phi::DenseTensor sum_split, square_sum_split, count_split;
+    sum_split.Resize(phi::make_ddim({world_size, C}));
+    square_sum_split.Resize(phi::make_ddim({world_size, C}));
+    count_split.Resize(phi::make_ddim({world_size, 1}));
+    dev_ctx.template Alloc<float>(&sum_split);
+    dev_ctx.template Alloc<float>(&square_sum_split);
+    dev_ctx.template Alloc<float>(&count_split);
+    std::vector<phi::DenseTensor*> split_stacked_combined = {&sum_split, &square_sum_split, &count_split};
+    auto num_secs = phi::IntArray({C, C, 1});
+    auto axis = phi::Scalar(1);
     custom_kernel::SplitKernel<float, Context>(
-        dev_ctx, stacked_combined, num_secs, 1, split_stacked_combined);
+        dev_ctx, stacked_combined, num_secs, axis, split_stacked_combined);
 
-    phi::DenseTensor mean_all, invstd_all;
-    phi::DenseTensorMeta meta = {phi::DataType::FLOAT32, {C}};
-    mean_all.set_meta(meta);
-    invstd_all.set_meta(meta);
-    dev_ctx.template Alloc<float>(&mean_all);
-    dev_ctx.template Alloc<float>(&invstd_all);
-
-    phi::DenseTensor running_mean, running_variance;
+    phi::DenseTensor mean_all, invstd_all, running_mean, running_variance, tmp_running_mean, tmp_running_variance;
+    mean_all.Resize(mean_out->dims());
+    invstd_all.Resize(variance_out->dims());
     running_mean.Resize(mean_out->dims());
     running_variance.Resize(variance_out->dims());
-
+    tmp_running_mean.Resize(mean_out->dims());
+    tmp_running_variance.Resize(variance_out->dims());
+    dev_ctx.template Alloc<float>(&mean_all);
+    dev_ctx.template Alloc<float>(&invstd_all);
     dev_ctx.template Alloc<float>(&running_mean);
     dev_ctx.template Alloc<float>(&running_variance);
+    dev_ctx.template Alloc<float>(&tmp_running_mean);
+    dev_ctx.template Alloc<float>(&tmp_running_variance);
     TensorCopy(dev_ctx, mean, false, &running_mean);
     TensorCopy(dev_ctx, variance, false, &running_variance);
 
-    NpuOpRunner runner_gather;
-    runner_gather.SetType("SyncBatchNormGatherStats")
-        .AddInput(*split_stacked_combined[0])  // sum all
-        .AddInput(*split_stacked_combined[1])  // square_sum_all
-        .AddInput(*split_stacked_combined[2])  // count_all
-        .Input(running_mean)
-        .Input(running_variance)
-        .AddOutput(mean_all)
-        .AddOutput(invstd_all)
-        .AddOutput(running_mean)
-        .AddOutput(running_variance)
-        .AddAttrs({{"momentum", static_cast<float>(1 - momentum)}})
-        .AddAttrs({{"eps", static_cast<float>(epsilon)}})
-        .Run(dev_ctx.stream());
+    phi::DenseTensor size;
+    // size.Resize({1});
+    dev_ctx.template Alloc<float>(&size);
+    auto sum_axis = phi::IntArray({0, 1});
+    auto out_dtype = phi::DataType::FLOAT32;
+    custom_kernel::SumKernel<float, Context>(dev_ctx, count_split, sum_axis, out_dtype, false, &size);
+    phi::DenseTensor size_int32;
+    phi::DenseTensorMeta size_int32_meta = {phi::DataType::INT32, {}};
+    size_int32.set_meta(size_int32_meta);
+    dev_ctx.template Alloc<float>(&size_int32);
+    out_dtype = phi::DataType::INT32;
+    custom_kernel::CastKernel<float, Context>(dev_ctx, size, out_dtype, &size_int32);
+
+    // NpuOpRunner runner_gather;
+    // runner_gather.SetType("SyncBatchNormGatherStats")
+    //     .AddInput(sum_split)  // sum all
+    //     .AddInput(square_sum_split)  // square_sum_all
+    //     .AddInput(size_int32)  // count all
+    //     .AddInput(running_mean)
+    //     .AddInput(running_variance)
+    //     .AddOutput(mean_all)
+    //     .AddOutput(invstd_all)
+    //     .AddOutput(tmp_running_mean)
+    //     .AddOutput(tmp_running_variance)
+    //     .AddAttrs({{"momentum", static_cast<float>(1 - momentum)}})
+    //     .AddAttrs({{"eps", static_cast<float>(epsilon_f)}})
+    //     .Run(dev_ctx.stream());
+
+    print_tensor(mean_all, "mean_all");
+    print_tensor(invstd_all, "invstd_all");
 
     // ======================================================
     // step 3: compute global mean/variance
     // ======================================================
-    phi::DenseTensor global_mean(mean_all), global_variance;
+    phi::DenseTensor global_mean(sum_split), global_variance(square_sum_split);
     phi::DenseTensorMeta one_meta = {phi::DataType::FLOAT32, {C}};
     phi::DenseTensor one;
     one.set_meta(one_meta);
-    dev_ctx.template Alloc<float>(one);
+    dev_ctx.template Alloc<float>(&one);
     FillNpuTensorWithConstant<float>(&one, dev_ctx, static_cast<float>(1.0));
 
-    phi::DenseTensor invstd_square;
-    custom_kernel::MultiplyKernel<float, Context>(
-        dev_ctx, invstd_all, invstd_all, &invstd_square);
-    custom_kernel::DivideKernel<float, Context>(
-        dev_ctx, one, invstd_pow, &global_variance);
+    // C_Device_st device{dev_ctx.GetPlace().GetDeviceId()};
+    // int array[C];
+    // MemCpyD2H(&device,
+    //           array,
+    //           one.data(),
+    //           sizeof(float));
+    // for (int i = 0; i < C; ++i) {
+    //   std::cout << array[i] << ", ";
+    // }
+    // std::cout << std::endl;
+
+    // phi::DenseTensor invstd_square;
+    // custom_kernel::MultiplyKernel<float, Context>(
+    //     dev_ctx, invstd_all, invstd_all, &invstd_square);
+    // custom_kernel::DivideKernel<float, Context>(
+    //     dev_ctx, one, invstd_square, &global_variance);
 
     // ======================================================
     // step 4: normalize input and update mean_out/variance_out
@@ -338,16 +389,16 @@ void SyncBatchNormKernel(const Context& dev_ctx,
     custom_kernel::BatchNormKernel<T, Context>(
         dev_ctx,
         x,
-        global_mean,      // use global mean
-        global_variance,  // use global variance
+        mean,      // use global mean
+        variance,  // use global variance
         scale,
         bias,
         is_test,
         momentum,
-        epsilon,
+        epsilon_f,
         data_layout_str,
         use_global_stats,
-        trainable_stats,
+        trainable_statistics,
         y,
         mean_out,
         variance_out,
